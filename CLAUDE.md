@@ -71,6 +71,7 @@ Do **not** delete the C code.
 6. Print a status line once per tick. Log every decision (tender evaluation with numbers, every order with its reason).
 
 **Knob defaults** (copy exactly): `FEE 0.02, REBATE 0.01, MAX_ORDER 10000, MAX_FX_ORDER 2500000, TENDER_SAFETY 0.03, TENDER_MIN_PROFIT 300, TENDER_BID_MARGIN 0.05, THIN_BOOK_PENALTY 0.05, UNWIND_MIN 100, UNWIND_SLICE 10000, UNWIND_PER_TICK 60000, UNWIND_BAND 0.04, MAX_EXPOSURE 80000, ARB_ENABLE True, ARB_ENTRY 0.06, ARB_EXIT 0.02, ARB_SLICE 2000, ARB_MAX_UNITS 30000, FX_HEDGE_ENABLE True, FX_BAND 25000, LIMIT_HEADROOM 0.90, FALLBACK_GROSS 250000, FALLBACK_NET 150000, NO_NEW_RISK_TICK 290, LOOP_MS 50, BOOK_DEPTH 20`.
+**Retuned in the Python bot after practice heats (2026-11-20):** `MAX_EXPOSURE 100000` (tenders are 71k–99k there; note E = net/2, so the 90% net headroom already caps |E| at 90k and the real tender cap is `LIMIT_HEADROOM`), `ARB_MAX_UNITS 10000` (a 30k pair used the gross room tenders needed, and lost money). Python-only: `SETTLE_TIMEOUT_MS 1000, SETTLE_MIN_MS 250, REJECT_BACKOFF_MS 500`.
 
 **CLI:** `python etf_arb.py --key KEY [--host localhost] [--port 9999] [--dry-run] [--log ticks.csv]`. Dry-run prints every decision but sends **no** orders, accepts and declines.
 
@@ -78,12 +79,20 @@ Do **not** delete the C code.
 - An early version unwound only top-of-book slices. After a 50k tender it sat unhedged for ~20 ticks and lost **$47k** on one mock heat. Hedging within `UNWIND_BAND` fixed it (+$9.9k). Speed of hedging > price-impact savings.
 - Leg balancing used to trade both legs. Now it trades one leg, in the direction that reduces E.
 - The mock's permanent-impact model penalizes basket hedging unrealistically. **Don't tune knobs on the mock**; tune on the practice server.
+- **Positions lag fills on the real server (2026-11-20 practice heat, lost ~$230k).** `GET /securities` shows a fill ~100–250 ms after the order returns. The original port (and the C bot) re-read stale positions every 50 ms and re-sent the same hedge, overshot, swung between ETF and basket, and churned gross up to 295k/300k by tick 77. Leg balance then resent one rejected order 3,022 times for the rest of the heat. Fixes in the Python bot, all deliberate departures from the C bot:
+  - After any trade, wait until `/securities` shows the fills the order responses reported (`SETTLE_TIMEOUT_MS`, `SETTLE_MIN_MS` for unknown sizes). This is not shadow state: RIT is still the truth, the bot only waits for it to catch up. Nothing else is traded in a loop that accepted a tender.
+  - Unwind sends all depth within `UNWIND_BAND` (up to budget) in one loop, as orders of ≤ `UNWIND_SLICE`, so the fill wait doesn't slow hedging.
+  - Unwind and leg balance check limits: allowed if within headroom or if they don't make gross/|net| worse; leg balance falls back to the other leg. A rejected order pauses trading `REJECT_BACKOFF_MS`.
+  - `--log` failing to open warns and continues (the first live launch died on a `PermissionError`).
+  - Test with `mock_rit_server.py --position-lag 0.2`; the full-heat test uses it. On it the old bot made money on 1/6 seeds, the fixed bot on 6/6 (and 6/6 without lag).
+  - **The C bot still has this bug.** Don't use it on the real server until it's ported.
 
 ## Testing
 ```bash
 cd rit-tools
-python -m unittest test_etf_arb -v                                     # run first after ANY bot/client change (61 tests, ~35 s)
+python -m unittest test_etf_arb -v                                     # run first after ANY bot/client change (80 tests, ~35 s)
 python mock_rit_server.py --case etf --tick-seconds 0.2 --seed 8      # 60-second heat, prints final NLV
+python mock_rit_server.py --case etf --tick-seconds 0.2 --position-lag 0.2  # fills show late, like the real server
 python etf_arb.py --key TESTKEY --dry-run                              # decisions only
 python etf_arb.py --key TESTKEY --log ticks.csv                        # live against the mock
 python mock_rit_server.py --case etf --tick-seconds 0.2 --rate-limit 2 # stress the 429 handling
@@ -94,13 +103,21 @@ python mock_rit_server.py --case etf --tick-seconds 0.2 --rate-limit 2 # stress 
 
 **Definition of done:** runs every seed above without exceptions; behaviour matches the C bot; dry-run sends zero orders; CSV log is written; README updated; `vol_scanner.py` still works.
 
-## Still unverified (check on the practice server: vol port 16620, ETF port 16630, host flserver.rotman.utoronto.ca)
-1. Is the tender `action` from *our* side (BUY = we receive shares)?
-2. Does trading RITC change the USD position?
-3. Does a marketable limit order earn the rebate or pay the fee?
-4. `api_orders_per_second` per ticker.
-5. Names and values in `/limits`.
-6. Field names against the Swagger page inside the RIT Client.
+## Practice server facts (checked 2026-11-20, ETF case, team07)
+- Tender `action` is from **our** side: accepting "BUY 76,000" made RITC +76,000.
+- Trading RITC **does** change the USD position (−76,000 × 25.90 after that tender).
+- `api_orders_per_second` = 50 for every ticker. ~120 requests/tick gave 0 rate limits.
+- `/limits` = `LIMIT-STOCK` (gross 300,000 / net 200,000, fine 0.5) and `LIMIT-CASH` (10M). 4,000 RITC showed gross 8,000, so the ETF does count ×2 (ignore the `units: 0.5` in `/securities`). The bot picks `LIMIT-STOCK` by name.
+- `/securities` says `trading_fee` 0.02 and `limit_order_rebate` **0.03** (not 0.01) for BULL, BEAR, RITC; USD/CAD 0.
+- Field names match the code. Positions lag fills ~100–250 ms (see Lessons).
+- **The API answers 401 a few seconds after every heat ends** (seen twice), and the same key works again in the next heat. So `rit_client` exits on 401 only if the key never worked; after a success, a 401 just fails that call and the bot prints "waiting for RIT client…" until the next heat.
+- Tenders were 71,000–99,000 RITC (14 seen over three heats), about one every 30 ticks. Most are bigger than `MAX_EXPOSURE` (80k), and above 90k they also break the net headroom (2 × 90k = 180k).
+- Fixed bot, live heat from tick 67 (2026-11-20): E stayed at 0, no rejected orders, no fill timeouts, 0 rate limits, gross ≤ 126k. All 6 tenders declined (5 for limit room; #1026 SELL 84k had +$16k estimated edge but 84k > `MAX_EXPOSURE`). Only stat arb traded: 46 entries, 22 exits, all MARKET. NLV −$12.8k at tick 299, before close-out.
+
+## Still unverified
+1. Does a marketable limit order earn the rebate or pay the fee? (Still open: the clean heat sent no limit orders, because no tender was accepted, so nothing needed unwinding.)
+2. Field names against the Swagger page inside the RIT Client.
+3. Does `POST /orders` report `quantity_filled` immediately? Probably yes: 204 market orders and no fill timeouts.
 
 ## Repo map
 ```

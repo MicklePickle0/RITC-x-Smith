@@ -26,6 +26,10 @@ EVERY LOOP (~50 ms)
   4. STAT ARB:  if RITC*USD and BULL+BEAR diverge by more than costs, trade the pair
   5. FX:        keep USD exposure (USD position + RITC value) near zero
   If step 2 or 3 traded, steps 4-5 wait for the next loop (positions are stale until re-read).
+  After ANY trade, the next loops do nothing until GET /securities shows the fills (the real
+  server reports them ~100-250 ms late; see SETTLE_TIMEOUT_MS). A rejected order pauses trading
+  for REJECT_BACKOFF_MS. Hedging trades that would break the limits are skipped unless they
+  reduce gross and |net|.
 
 CONVENTIONS
   * Positions: + = long (we own it), - = short (we owe it). Quantities are shares / units.
@@ -47,7 +51,9 @@ import traceback
 from rit_client import NAN, RitClient, num, walk
 
 # ======================= STRATEGY KNOBS (tune on the practice server) ======================= #
-# Same names and defaults as the #defines in etf_arb/etf_arb.c.
+# Same names and defaults as the #defines in etf_arb/etf_arb.c, EXCEPT MAX_EXPOSURE and
+# ARB_MAX_UNITS (retuned on the practice server, see their comments). The SETTLE_* and
+# REJECT_BACKOFF_MS knobs exist only here.
 
 # --- case facts (from the brief; don't tune) ---
 FEE = 0.02                # $/share on market orders (stocks CAD, RITC USD)
@@ -66,12 +72,17 @@ THIN_BOOK_PENALTY = 0.05  # $/unit beyond visible depth when walking the book (p
 
 # --- unwind: how fast to hedge ---
 UNWIND_MIN = 100          # ignore exposure below this many units (also min arb size)
-UNWIND_SLICE = 10000      # max units per slice (= max order size)
+UNWIND_SLICE = 10000      # max units per order (= max order size); one loop may send several
 UNWIND_PER_TICK = 60000   # max units unwound per tick (liquidity refills each tick)
 UNWIND_BAND = 0.04        # $ we are willing to walk past the touch to hedge quickly.
                           # Bigger = faster hedge, more impact. Unhedged drift costs
                           # ~$0.08/unit per tick of waiting, so don't make this tiny.
-MAX_EXPOSURE = 80000      # never accept a tender that leaves |E| above this
+MAX_EXPOSURE = 100000     # never accept a tender that leaves |E| above this.
+                          #   C default 80,000. Raised after a practice heat: tenders there are
+                          #   71k-99k, and an 84k one with +$16k edge was declined at 80k.
+                          #   NOTE E = net/2, so the 90% net headroom (180k) already caps |E| at
+                          #   90k: anything >= 90k here changes nothing. To take tenders above
+                          #   90k, raise LIMIT_HEADROOM (net limit 200k -> max 100k RITC).
 
 # --- stat arb ---
 ARB_ENABLE = True
@@ -79,7 +90,11 @@ ARB_ENTRY = 0.06          # CAD/unit profit after fees needed to open a pair
 ARB_EXIT = 0.02           # CAD/unit profit needed to close a pair early (< ARB_ENTRY, so a
                           #   pair isn't opened and closed on the same small wiggle)
 ARB_SLICE = 2000          # units per arb trade (3 market orders: RITC, BULL, BEAR)
-ARB_MAX_UNITS = 30000     # stop opening new pairs above this many units
+ARB_MAX_UNITS = 10000     # stop opening new pairs above this many units.
+                          #   C default 30,000. Lowered after a practice heat: a 30k pair used
+                          #   120k of gross, which blocked an 84k tender (the real money), and
+                          #   the arb itself lost ~$12.8k there. Set ARB_ENABLE = False to test
+                          #   tenders alone.
 
 # --- FX ---
 FX_HEDGE_ENABLE = True
@@ -92,6 +107,17 @@ FALLBACK_NET = 150000
 NO_NEW_RISK_TICK = 290    # after this: no new tenders or arbs, only unwind (heat = 300 ticks)
 LOOP_MS = 50              # target loop period; the market itself updates once per second
 BOOK_DEPTH = 20           # order-book levels fetched per ticker
+
+# --- waiting for fills (Python only; the C bot has no equivalent and churns on the real server) ---
+# On the practice server a fill shows up in GET /securities ~100-250 ms AFTER the order returns.
+# Trading again on the old positions re-sends the same hedge, overshoots, and swings back and
+# forth (lost ~$230k in one practice heat). So after any trade the bot waits until the positions
+# show the fills the order responses reported, before deciding anything else.
+SETTLE_TIMEOUT_MS = 1000  # give up waiting after this long (prints a warning) and trade again
+SETTLE_MIN_MS = 250       # wait at least this long when a fill size is unknown (USD orders,
+                          #   competitive tenders, orders reporting 0 filled, failed POSTs)
+REJECT_BACKOFF_MS = 500   # after a rejected order, pause trading this long instead of resending
+                          #   the same rejected order 20 times a second
 # ============================================================================================ #
 
 # CSV columns written by --log, one row per tick (at the first loop of that tick):
@@ -145,6 +171,7 @@ class TickLog:
     Appends to an existing file (header written only when the file is new/empty)."""
 
     def __init__(self, path):
+        """Raises OSError if the file can't be opened (main() then runs without a log)."""
         new = not os.path.exists(path) or os.path.getsize(path) == 0
         self.f = open(path, "a", newline="")
         self.w = csv.writer(self.f)
@@ -153,11 +180,18 @@ class TickLog:
             self.f.flush()
 
     def row(self, values):
-        self.w.writerow(values)
-        self.f.flush()
+        if self.f is None:
+            return
+        try:
+            self.w.writerow(values)
+            self.f.flush()
+        except OSError as e:           # disk full, file locked by Excel...: keep trading, stop logging
+            print(f"!! CSV log write failed ({e}); logging stopped, bot keeps running", file=sys.stderr)
+            self.f = None
 
     def close(self):
-        self.f.close()
+        if self.f is not None:
+            self.f.close()
 
 
 class Bot:
@@ -166,6 +200,10 @@ class Bot:
       decided                  tender ids already accepted/declined this heat (never decide twice)
       last_tick, unwound_this_tick   per-tick unwind budget bookkeeping
       last_status_tick         to print the status line / CSV row once per tick
+      sent, pending            fills reported by this loop's orders / fills we are waiting to
+                               SEE in GET /securities (see SETTLE_TIMEOUT_MS). This is not a
+                               shadow position: RIT stays the truth, we only wait for it to catch up.
+      backoff_until            no trading before this time, after a rejected order
     """
 
     def __init__(self, api, dry_run, log=None):
@@ -178,12 +216,19 @@ class Bot:
         self.last_tick = -1
         self.unwound_this_tick = 0
         self.last_status_tick = -1
+        self.clock = time.monotonic    # replaceable in tests
+        self.sent = []                 # (ticker, signed qty filled, size known?) this loop
+        self.pending = None            # (positions before, {ticker: delta}, need_min_wait, t_sent)
+        self.backoff_until = 0.0
+        self.blocked_tick = -1         # last tick we printed "blocked by limits"
 
     # ------------------------------------------------------------------ helpers
     def read_limits(self):
-        """Load gross/net limits from GET /limits. Returns True once real limits are known."""
-        lim = self.api.limits()
-        e = lim[0] if lim else None    # first limit block; ETF case has one
+        """Load gross/net limits from GET /limits. Returns True once real limits are known.
+        The practice server returns LIMIT-STOCK (300k/200k, what BULL/BEAR/RITC count against)
+        and LIMIT-CASH (10M, currencies): use LIMIT-STOCK, or the first block if it isn't named so."""
+        lim = self.api.limits() or []
+        e = next((x for x in lim if x.get("name") == "LIMIT-STOCK"), lim[0] if lim else None)
         if e and num(e.get("gross_limit"), 0) > 0:
             self.gross_limit = int(num(e.get("gross_limit"), 0))
             self.net_limit = int(num(e.get("net_limit"), 0))
@@ -194,6 +239,21 @@ class Bot:
         """Would these (planned) positions stay within LIMIT_HEADROOM of both limits?"""
         return (gross_of(bull, bear, ritc) <= int(LIMIT_HEADROOM * self.gross_limit) and
                 abs(net_of(bull, bear, ritc)) <= int(LIMIT_HEADROOM * self.net_limit))
+
+    def allowed(self, m, bull, bear, ritc):
+        """For hedging trades (unwind, leg balance). Gross and net are checked separately: each
+        must fit the headroom, OR at least not get worse (cutting risk is always allowed, even
+        when already near a limit)."""
+        g_new, n_new = gross_of(bull, bear, ritc), abs(net_of(bull, bear, ritc))
+        return ((g_new <= int(LIMIT_HEADROOM * self.gross_limit) or
+                 g_new <= gross_of(m.p_bull, m.p_bear, m.p_ritc)) and
+                (n_new <= int(LIMIT_HEADROOM * self.net_limit) or
+                 n_new <= abs(net_of(m.p_bull, m.p_bear, m.p_ritc))))
+
+    def blocked(self, tick, what):
+        if tick != self.blocked_tick:  # once per tick, not every loop
+            self.blocked_tick = tick
+            print(f"[t{tick:3d}] {what} blocked by limits (gross/net), skipped")
 
     def send(self, ticker, action, qty, limit_px=None, why=""):
         """Print and (unless dry-run) send ONE order. limit_px=None -> MARKET, else LIMIT at that price.
@@ -211,12 +271,17 @@ class Bot:
         r = self.api.order(ticker, action, qty, "MARKET" if limit_px is None else "LIMIT", limit_px)
         if r is None:
             print(f"     !! order failed: {self.api.last_error}")
+            self.backoff_until = self.clock() + REJECT_BACKOFF_MS / 1000.0
+            self.sent.append((ticker, 0, False))   # a dropped POST may still have filled
             return False
+        filled = int(num(r.get("quantity_filled"), 0))
+        self.sent.append((ticker, filled if action == "BUY" else -filled, filled > 0 and ticker != "USD"))
         return True
 
-    def slice_send(self, ticker, action, qty, px=None, why=""):
-        """Send qty as several orders no bigger than the max order size; stop at the first failure."""
-        maxq = MAX_FX_ORDER if ticker == "USD" else MAX_ORDER
+    def slice_send(self, ticker, action, qty, px=None, why="", maxq=None):
+        """Send qty as several orders no bigger than maxq (default: the max order size);
+        stop at the first failure."""
+        maxq = maxq or (MAX_FX_ORDER if ticker == "USD" else MAX_ORDER)
         qty = int(qty)
         while qty > 0:
             q = min(qty, maxq)
@@ -315,8 +380,13 @@ class Bot:
             if (tick < NO_NEW_RISK_TICK and room and per_unit > 0 and profit >= TENDER_MIN_PROFIT
                     and not math.isnan(price)):
                 print("       ACCEPT")
-                if not self.dry_run and not self.api.accept_tender(tid, None if fixed else price):
-                    print(f"       !! accept failed: {self.api.last_error}")
+                if not self.dry_run:
+                    ok = self.api.accept_tender(tid, None if fixed else price)
+                    if not ok:
+                        print(f"       !! accept failed: {self.api.last_error}")
+                    # fixed + accepted: we will hold Q more/less RITC. Competitive bids can be
+                    # lost, and a failed POST may have gone through: size unknown -> min wait.
+                    self.sent.append(("RITC", (Q if we_buy else -Q) if ok and fixed else 0, ok and fixed))
             else:
                 print("       decline")
                 if not self.dry_run and not self.api.decline_tender(tid):
@@ -347,15 +417,23 @@ class Bot:
             d_bear = depth_within(m.bear_bids if sell else m.bear_asks, UNWIND_BAND, not sell)
 
             def size(top):
-                """Slice size: never more than the exposure, a slice, the budget, or the depth."""
-                return min(int(abs(E)), UNWIND_SLICE, budget, top)
+                """How much to hedge now: never more than the exposure, the budget, or the depth
+                within the band. Sent as orders of at most UNWIND_SLICE, all in this loop: the
+                book only changes once a tick, and the next loop has to wait for these fills to
+                show up anyway. (C bot: one slice per loop, relying on 20 loops a second, which
+                only worked because it traded on stale positions.)"""
+                return min(int(abs(E)), budget, top)
 
             q = size(d_etf if use_etf else min(d_bull, d_bear))   # basket: limited by thinner leg
             if not use_etf:   # basket legs move E by q/2 each, so trade q per leg to move E by q
                 sgn = -q if sell else q
-                if not self.fits_limits(m.p_bull + sgn, m.p_bear + sgn, m.p_ritc):
+                if not self.allowed(m, m.p_bull + sgn, m.p_bear + sgn, m.p_ritc):
                     use_etf = True
                     q = size(d_etf)   # (C version kept the basket's depth here)
+            if use_etf and q > 0 and not self.allowed(m, m.p_bull, m.p_bear,
+                                                      m.p_ritc + (-q if sell else q)):
+                self.blocked(tick, f"unwind E={E:.0f}")   # (C version never checked the ETF leg)
+                q = 0
             if q > 0:
                 act = "SELL" if sell else "BUY"
                 why = (f"unwind E={E:.0f} via {'ETF' if use_etf else 'basket'} "
@@ -365,10 +443,13 @@ class Bot:
                 # never walks further; any unfilled rest is cancelled next loop
                 s = -UNWIND_BAND if sell else UNWIND_BAND
                 if use_etf:
-                    self.send("RITC", act, q, (m.ritc_bid if sell else m.ritc_ask) + s, "unwind")
+                    self.slice_send("RITC", act, q, (m.ritc_bid if sell else m.ritc_ask) + s, "unwind",
+                                    UNWIND_SLICE)
                 else:
-                    self.send("BULL", act, q, (m.bull_bid if sell else m.bull_ask) + s, "unwind leg")
-                    self.send("BEAR", act, q, (m.bear_bid if sell else m.bear_ask) + s, "unwind leg")
+                    self.slice_send("BULL", act, q, (m.bull_bid if sell else m.bull_ask) + s, "unwind leg",
+                                    UNWIND_SLICE)
+                    self.slice_send("BEAR", act, q, (m.bear_bid if sell else m.bear_ask) + s, "unwind leg",
+                                    UNWIND_SLICE)
                 self.unwound_this_tick += q
                 traded = True
 
@@ -379,12 +460,19 @@ class Bot:
             # Trade ONE leg, picking the direction that also shrinks E:
             #   E > 0 (too long)   -> sell the leg that is too big
             #   E <= 0 (too short) -> buy the leg that is too small
-            if E > 0:
-                leg = "BULL" if imb > 0 else "BEAR"
+            big, small = ("BULL", "BEAR") if imb > 0 else ("BEAR", "BULL")
+            choices = [(big, "SELL"), (small, "BUY")] if E > 0 else [(small, "BUY"), (big, "SELL")]
+            # If the preferred trade would break the limits, use the other one (e.g. near the gross
+            # limit, buying the small leg is refused but selling the big leg cuts gross).
+            for leg, act in choices:
+                d = q if act == "BUY" else -q
+                if self.allowed(m, m.p_bull + (d if leg == "BULL" else 0),
+                                m.p_bear + (d if leg == "BEAR" else 0), m.p_ritc):
+                    self.send(leg, act, q, None, "leg balance")
+                    traded = True
+                    break
             else:
-                leg = "BEAR" if imb > 0 else "BULL"
-            self.send(leg, "SELL" if E > 0 else "BUY", q, None, "leg balance")
-            traded = True
+                self.blocked(tick, "leg balance")
         return traded
 
     # ------------------------------------------------------------------ 4. stat arb
@@ -498,6 +586,7 @@ class Bot:
                 if idle % 20 == 1:
                     print(f"case status {status}, waiting...")
                 self.decided.clear()
+                self.pending = None
                 time.sleep(0.25)
                 continue
             idle = 0
@@ -519,13 +608,49 @@ class Bot:
             return
         if tick < self.last_status_tick:   # new heat without us seeing a STOPPED status (we were
             self.decided.clear()           # disconnected): tender ids may restart from 1
+            self.pending = None            # and last heat's fills will never show up
         if tick != self.last_status_tick:
             self.last_status_tick = tick
             self.status(m, tick)
+        if self.waiting_for_fills(m, tick):   # positions don't show our last trades yet
+            return
+        self.sent = []
         self.handle_tenders(m, tick)
-        if not self.unwind(m, tick):   # only one kind of action per loop: the next
-            self.stat_arb(m, tick)     # loop re-reads positions, so nothing doubles
-            self.fx_hedge(m, tick)
+        # An accepted tender changes RITC: positions in `m` are stale, so do nothing else this loop.
+        if not self.sent and self.clock() >= self.backoff_until:   # (backoff: rejected order)
+            if not self.unwind(m, tick):   # only one kind of action per loop: the next
+                self.stat_arb(m, tick)     # loop re-reads positions, so nothing doubles
+                self.fx_hedge(m, tick)
+        if self.sent:                      # wait until GET /securities shows these fills
+            unknown = {t for t, _, known in self.sent if not known}
+            deltas = {}
+            for t, d, known in self.sent:
+                if t not in unknown:       # a ticker with an unknown-size trade can't be checked
+                    deltas[t] = deltas.get(t, 0) + d
+            self.pending = ({"BULL": m.p_bull, "BEAR": m.p_bear, "RITC": m.p_ritc}, deltas,
+                            bool(unknown), self.clock())
+            self.sent = []
+
+    def waiting_for_fills(self, m, tick):
+        """True while GET /securities doesn't yet show the fills our last orders reported.
+        Each ticker must have moved at least the reported fill, in the right direction (more is
+        fine: a resting remainder may have filled too). Unknown sizes wait SETTLE_MIN_MS."""
+        if self.pending is None:
+            return False
+        before, deltas, need_min, t_sent = self.pending
+        waited = self.clock() - t_sent
+        now = {"BULL": m.p_bull, "BEAR": m.p_bear, "RITC": m.p_ritc}
+        seen = all((now[t] - before[t]) * (1 if d > 0 else -1) >= abs(d)
+                   for t, d in deltas.items() if d)
+        if seen and (not need_min or waited >= SETTLE_MIN_MS / 1000.0):
+            self.pending = None
+            return False
+        if waited >= SETTLE_TIMEOUT_MS / 1000.0:
+            print(f"[t{tick:3d}] !! fills not visible in positions after {SETTLE_TIMEOUT_MS} ms "
+                  f"(expected {deltas}); trading on what RIT shows")
+            self.pending = None
+            return False
+        return True
 
 
 def main():
@@ -545,12 +670,17 @@ def main():
         os.system("")   # enable ANSI handling in Windows consoles
 
     api = RitClient(a.host, a.port, a.key)
-    log = TickLog(a.log) if a.log else None
+    log = None
+    if a.log:
+        try:
+            log = TickLog(a.log)
+        except OSError as e:           # a bad log path must not cost a heat
+            print(f"warning: can't open log file {a.log!r} ({e}); running WITHOUT a CSV log")
     bot = Bot(api, a.dry_run, log)
     if not bot.read_limits():
         print("warning: /limits unavailable, using fallback limits (will retry each tick)")
     print(f"ETF arb bot: {a.host}:{a.port}  limits gross {bot.gross_limit} net {bot.net_limit}  "
-          + ("[DRY RUN: no orders]" if a.dry_run else "") + (f"  logging to {a.log}" if a.log else ""))
+          + ("[DRY RUN: no orders]" if a.dry_run else "") + (f"  logging to {a.log}" if log else ""))
     try:
         bot.run()
     except KeyboardInterrupt:

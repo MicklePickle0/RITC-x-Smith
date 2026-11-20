@@ -85,9 +85,9 @@ No build step. **All knobs are UPPER_CASE constants at the top of `etf_arb.py`**
 **CSV log** (`--log FILE`, appended, flushed every row): `time, tick, bull_mid, bear_mid, ritc_mid, usd_mid, fair_usd, dev_cad, pos_ritc, pos_bull, pos_bear, pos_usd, E, gross, nlv, requests, rate_limited`. Load it with pandas/Excel after a heat to see how fast E went back to 0 after each tender and which knobs mattered.
 
 ### Files
-- `rit_client.py`: shared REST client with keep-alive and TCP_NODELAY. **It never retries a POST/DELETE after a network error**, so an order or tender accept can't be sent twice. It retries a GET once if a kept-alive socket went stale. On HTTP 429 it waits the `wait` seconds RIT returns (or `Retry-After`) and retries. A 401 stops the program with a "wrong API key" message.
-- `etf_arb.py`: the strategy, a behaviour-for-behaviour port of `etf_arb/etf_arb.c`. Every function and knob is commented.
-- `test_etf_arb.py`: 61 tests covering every decision rule (with hand-computed numbers), the client's safety rules against a real local server, and one full heat on the mock. Run `python -m unittest test_etf_arb -v` after **any** change to the bot. Set `SKIP_SLOW=1` to skip the 30 s full heat.
+- `rit_client.py`: shared REST client with keep-alive and TCP_NODELAY. **It never retries a POST/DELETE after a network error**, so an order or tender accept can't be sent twice. It retries a GET once if a kept-alive socket went stale. On HTTP 429 it waits the `wait` seconds RIT returns (or `Retry-After`) and retries. A 401 stops the program with a "wrong API key" message, unless the key has already worked: RIT also answers 401 after every heat ends, so then the bot just waits for the next heat.
+- `etf_arb.py`: the strategy, ported from `etf_arb/etf_arb.c`, plus fixes for the real server (see "Waiting for fills" below). Every function and knob is commented.
+- `test_etf_arb.py`: 80 tests covering every decision rule (with hand-computed numbers), the fill wait and limit checks, the client's safety rules against a real local server, and one full heat on the mock with fills shown 0.2 s late. Run `python -m unittest test_etf_arb -v` after **any** change to the bot. Set `SKIP_SLOW=1` to skip the 30 s full heat.
 
 ### Logic (each loop, ~50 ms)
 1. Cancel stale resting orders, then read positions and the BULL/BEAR/RITC books. RIT's positions are always treated as the truth.
@@ -100,6 +100,8 @@ No build step. **All knobs are UPPER_CASE constants at the top of `etf_arb.py`**
 
 Steps 4–6 are skipped in any loop where the unwind traded, because positions are stale until the next read.
 
+**Waiting for fills.** On the practice server a fill shows up in `GET /securities` about 100–250 ms *after* the order returns. Trading on the old positions made the first live heat re-send the same hedge over and over: it swung between ETF and basket, churned gross to 295k/300k and lost ~$230k. So after any trade the bot does nothing until the positions show the fills the order responses reported (`SETTLE_TIMEOUT_MS`, default 1 s, then it warns and carries on; `SETTLE_MIN_MS` when a size is unknown). To keep hedging fast anyway, the unwind sends everything within `UNWIND_BAND` in one loop, as orders of at most `UNWIND_SLICE`. Unwind and leg balance never push gross/net past the headroom unless the trade reduces them, and a rejected order pauses trading for `REJECT_BACKOFF_MS`. Reproduce it offline with `mock_rit_server.py --position-lag 0.2`.
+
 The biggest risk it manages is **unhedged exposure after a big tender**. On a mock heat, slicing only the top of the book left the bot short 50k for ~20 ticks and lost $47k. Hedging within a $0.04 band turned that heat into +$9.9k.
 
 **Robustness:** a stopped RIT Client gives `waiting for RIT client...` and the bot resumes by itself; if `/limits` was unavailable at start it keeps retrying and switches to the real limits. An unexpected error in one loop is printed with a traceback and the bot keeps going. Ctrl+C cancels open orders before exiting.
@@ -107,7 +109,7 @@ The biggest risk it manages is **unhedged exposure after a big tender**. On a mo
 **Windows tip:** a refused connection to `localhost` costs ~2 s per address on Windows (it tries IPv6 `::1` first). The client remembers the address that worked, but if startup feels slow, pass `--host 127.0.0.1`.
 
 ### Alternative: the C bot (`etf_arb/`)
-Same strategy and knobs (as `#define`s), for if Python is unavailable. It has no CSV log. One difference: when the unwind falls back from the basket to the ETF because the basket won't fit the limits, the C version still sizes the slice by the basket's depth; the Python version uses the ETF's depth.
+Same strategy and knobs (as `#define`s), for if Python is unavailable. It has no CSV log. **It does not have the fill wait, limit checks on hedging, or reject backoff, so it churns on the real server (see above). Don't run it live until those are ported.** Another difference: when the unwind falls back from the basket to the ETF because the basket won't fit the limits, the C version still sizes the slice by the basket's depth; the Python version uses the ETF's depth.
 
 | Platform | Command |
 |---|---|
@@ -121,13 +123,12 @@ It compiles cleanly with `-Wall -Wextra` on gcc and clang; the Windows build is 
 
 ## 4. Check these on the practice server (ports 16620 vol / 16630 ETF)
 
-1. **Tender `action`**: is `BUY` from *your* side? Accept one small tender and watch your position.
-2. **USD booking**: after trading RITC, does your USD position change by the cash amount? The FX formula works either way, but confirm it.
-3. **Fee vs rebate on marketable limits**: does a limit order that fills immediately earn the $0.01 rebate or pay the $0.02 fee? If it earns the rebate, always use marketable limits.
-4. **`api_orders_per_second`** for each ticker (`GET /v1/securities`). Lower `LOOP_MS` / slice counts if you hit 429s a lot. The bot prints `rl` (rate-limit hits).
-5. **`/v1/limits`** names and values for the ETF case. The bot reads the first block.
-6. **News wording** in the vol case. Watch the scanner's `news:` line parse it. If it doesn't, use the `s`/`n` overrides.
-7. Field names against the **Swagger page** in the RIT Client (`/v1/...`).
+Checked on 2026-11-20 (ETF case): tender `action` is from your side; trading RITC does move the USD position; `api_orders_per_second` is 50; `/v1/limits` has `LIMIT-STOCK` (300k gross / 200k net, ETF ×2) and `LIMIT-CASH` (10M), and the bot uses `LIMIT-STOCK`; the stated `limit_order_rebate` is **$0.03**; positions lag fills by ~100–250 ms. Still to check:
+
+1. **Fee vs rebate on marketable limits**: does a limit order that fills immediately earn the $0.03 rebate or pay the $0.02 fee? If it earns the rebate, always use marketable limits.
+2. **Order responses**: does `POST /orders` report `quantity_filled` straight away? If not, the bot waits `SETTLE_MIN_MS` after each trade instead.
+3. **News wording** in the vol case. Watch the scanner's `news:` line parse it. If it doesn't, use the `s`/`n` overrides.
+4. Field names against the **Swagger page** in the RIT Client (`/v1/...`).
 
 ## 5. Next steps (roadmap)
 

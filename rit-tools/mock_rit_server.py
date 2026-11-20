@@ -10,6 +10,11 @@ Then tune strategy on the real practice server.
     python3 mock_rit_server.py --case vol            # Volatility Trading Case
     python3 mock_rit_server.py --case etf            # Algorithmic ETF Arbitrage Case
     python3 mock_rit_server.py --case etf --tick-seconds 0.2 --loop
+    python3 mock_rit_server.py --case etf --tick-seconds 0.2 --position-lag 0.25
+
+--position-lag S: GET /securities and GET /limits show positions as they were S seconds ago,
+like the real practice server (fills showed up there ~100-250 ms after the order returned).
+Orders are still checked against the true positions, and order responses report fills at once.
 
 Standard library only. API key defaults to TESTKEY (header X-API-Key).
 """
@@ -46,10 +51,11 @@ def bs(S, K, T, sig, kind):
 # Case state
 # --------------------------------------------------------------------------- #
 class Market:
-    def __init__(self, case, tick_seconds, rate_limit):
+    def __init__(self, case, tick_seconds, rate_limit, position_lag=0.0):
         self.case = case
         self.tick_seconds = tick_seconds
         self.rate_limit = rate_limit
+        self.position_lag = position_lag   # seconds before a fill shows in /securities and /limits
         self.lock = threading.RLock()
         self.reset()
 
@@ -59,6 +65,7 @@ class Market:
         self.tick = 0
         self.status = "ACTIVE"
         self.positions = {}
+        self.pos_history = [(0.0, {})]   # (time, copy of positions) after each change, for position_lag
         self.cash = 0.0  # CAD
         self.next_order_id = 1
         self.open_orders = {}
@@ -240,6 +247,20 @@ class Market:
             fee = -0.01 * qty if rebate else 0.02 * qty
         self.cash -= fee
         self.fees += fee
+        self._record_positions()
+
+    def _record_positions(self):
+        if self.position_lag > 0:
+            self.pos_history.append((time.time(), dict(self.positions)))
+
+    def reported_positions(self):
+        """Positions as GET /securities and /limits show them: `position_lag` seconds old."""
+        if self.position_lag <= 0:
+            return self.positions
+        cutoff = time.time() - self.position_lag
+        while len(self.pos_history) > 1 and self.pos_history[1][0] <= cutoff:
+            self.pos_history.pop(0)          # keep the newest snapshot that is old enough
+        return self.pos_history[0][1]
 
     def limits_check(self, ticker, action, qty):
         pos = dict(self.positions)
@@ -308,6 +329,7 @@ class Market:
         if self.case == "etf":
             self.cash += self.positions.get("USD", 0) * self.mid["USD"]
             self.positions["USD"] = 0
+        self._record_positions()
 
     def nlv(self):
         total = self.cash
@@ -323,6 +345,7 @@ class Market:
         return total - (self.penalty if self.case == "vol" else 0)
 
     def securities(self):
+        shown = self.reported_positions()
         out = []
         for t in self.tickers:
             if t == "CAD":
@@ -332,7 +355,7 @@ class Market:
             out.append({"ticker": t, "type": ("CURRENCY" if t in ("CAD", "USD") else
                                               ("OPTION" if self.case == "vol" and t != "RTM" else
                                                ("ETF" if t == "RITC" else "STOCK"))),
-                        "position": self.positions.get(t, 0), "bid": bid, "ask": ask,
+                        "position": shown.get(t, 0), "bid": bid, "ask": ask,
                         "last": round((bid + ask) / 2, 4), "bid_size": 10000, "ask_size": 10000,
                         "currency": ("USD" if t == "RITC" else "CAD"),
                         "unit_multiplier": 100 if (self.case == "vol" and t != "RTM") else 1,
@@ -402,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
                          "gross_limit": 50000, "net_limit": 50000, "gross_fine": 0, "net_fine": 0},
                         {"name": "OPTIONS", "gross": sum(map(abs, opt)), "net": sum(opt),
                          "gross_limit": 2500, "net_limit": 1000, "gross_fine": 0, "net_fine": 0}])
-                pos = M.positions
+                pos = M.reported_positions()
                 g_ = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(pos.get("RITC", 0))
                 n_ = pos.get("BULL", 0) + pos.get("BEAR", 0) + 2 * pos.get("RITC", 0)
                 return self._send(200, [{"name": "LIMIT-STOCK", "gross": g_, "net": n_,
@@ -510,11 +533,13 @@ def main():
     ap.add_argument("--rate-limit", type=int, default=10, help="orders per second per ticker")
     ap.add_argument("--loop", action="store_true", help="restart a new heat 5 s after each one ends")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--position-lag", type=float, default=0.0, metavar="S",
+                    help="seconds before fills show in /securities and /limits (practice server ~0.1-0.25)")
     a = ap.parse_args()
     if a.seed is not None:
         random.seed(a.seed)
     API_KEY = a.key
-    M = Market(a.case, a.tick_seconds, a.rate_limit)
+    M = Market(a.case, a.tick_seconds, a.rate_limit, a.position_lag)
     if M.case == "vol":
         print("Mock vol case. Weekly sigmas (secret!):", [round(s, 2) for s in M.week_sig])
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)

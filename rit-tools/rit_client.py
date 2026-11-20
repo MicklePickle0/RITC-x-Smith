@@ -9,7 +9,10 @@ Safety rules (do not loosen):
                   so a retry could send an order twice. Callers re-read positions instead.
   * HTTP 429:     sleep for the JSON `wait` field (or the Retry-After header) and retry. That is
                   safe for every method, because the server rejected the request.
-  * HTTP 401:     raises SystemExit with a clear "wrong API key" message.
+  * HTTP 401:     before any request has succeeded: raises SystemExit with a clear "wrong API key"
+                  message. AFTER the key has worked once: the RIT Client also answers 401 a few
+                  seconds after every heat ends (seen on the practice server), so it is treated as
+                  "case not running": the call fails (None) and callers keep waiting.
 
 Two layers:
   * request()/get()/post()/delete() return (status, data) and raise RitConnectionError (an
@@ -73,6 +76,7 @@ class RitClient:
         self.requests = 0
         self.rate_limited = 0
         self.last_error = ""
+        self.key_ok = False            # True once any request got 200 with this key
 
     def close(self):
         """Close the kept-alive socket (a later call simply reconnects)."""
@@ -163,8 +167,15 @@ class RitClient:
                 self.last_error = f"{method} {url} -> 429 (still rate limited after {self.MAX_ATTEMPTS} tries)"
                 return status, data
             if status == 401:
-                raise SystemExit("401 Unauthorized: wrong API key? Use the key shown in the RIT Client "
-                                 "(API icon in the bottom status bar).")
+                if not self.key_ok:
+                    raise SystemExit("401 Unauthorized: wrong API key? Use the key shown in the RIT Client "
+                                     "(API icon in the bottom status bar).")
+                # the key worked before: RIT answers 401 between heats -> fail this call, don't exit
+                self.last_error = (f"{method} {url} -> 401 (heat over? the key worked before; "
+                                   "if this lasts into the next heat, re-check the key)")
+                return status, data
+            if status == 200:
+                self.key_ok = True
             if status != 200:
                 msg = data.get("message", "") if isinstance(data, dict) else ""
                 self.last_error = f"{method} {url} -> {status} {msg}"

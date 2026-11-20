@@ -85,10 +85,19 @@ class FakeApi:
     def trader(self):
         return {"nlv": self.nlv}
 
-    # writes (recorded)
+    # writes (recorded). Positions do NOT change: tests move self.pos by hand to play the server.
+    report_fills = False   # True: order responses carry quantity_filled = qty (like the real server)
+    reject = False         # True: every order fails, like a limit rejection
+
     def order(self, ticker, action, qty, otype="MARKET", price=None):
         self.calls.append(("order", ticker, action, qty, otype, price))
-        return {"order_id": len(self.calls)}
+        if self.reject:
+            self.last_error = "POST /v1/orders -> 500 exceeds gross trading limits"
+            return None
+        r = {"order_id": len(self.calls)}
+        if self.report_fills:
+            r["quantity_filled"] = qty
+        return r
 
     def accept_tender(self, tid, price=None):
         self.calls.append(("accept", tid, price))
@@ -245,8 +254,19 @@ class TestTenders(BotCase):
         self.assertIn("exit via basket 19.960", self.out.getvalue())
 
     def test_max_exposure_declines(self):
-        # Q = 90,000 would leave E = 90,000 > MAX_EXPOSURE 80,000 (even at a great price)
-        self.assertEqual(self.decide(tender(qty=90000, price=20.00)), [("decline", 1)])
+        # with MAX_EXPOSURE 50,000: Q = 60,000 leaves E = 60,000 -> decline (even at a great price)
+        from unittest import mock as um
+        with um.patch.object(etf_arb, "MAX_EXPOSURE", 50000):
+            self.assertEqual(self.decide(tender(qty=60000, price=20.00)), [("decline", 1)])
+        self.assertIn("NO LIMIT ROOM", self.out.getvalue())
+
+    def test_90k_tender_fits(self):
+        # practice-server sizes: 90,000 -> net 2 x 90k = 180k = 90% of 200k, gross 180k: accept
+        self.assertEqual(self.decide(tender(qty=90000, price=20.00)), [("accept", 1, None)])
+
+    def test_net_headroom_declines_above_90k(self):
+        # 95,000 -> net 190k > 180k (90% of 200k). E = net/2, so this is the real tender cap.
+        self.assertEqual(self.decide(tender(qty=95000, price=20.00)), [("decline", 1)])
         self.assertIn("NO LIMIT ROOM", self.out.getvalue())
 
     def test_gross_limit_declines(self):
@@ -284,12 +304,19 @@ class TestUnwind(BotCase):
     def test_sell_via_etf_with_band(self):
         # Long 20,000 RITC -> E = +20,000 -> sell.
         #   ETF proceeds 25.00 - 0.02 = 24.98 vs basket (10.00 + 15.00 - 0.04)/1 = 24.96 -> ETF
-        #   q = min(|E| 20000, slice 10000, budget 60000, depth within band 25000) = 10000
-        #   marketable LIMIT 0.04 through the bid: 24.96
+        #   q = min(|E| 20000, budget 60000, depth within band 25000) = 20000, all in this loop,
+        #   as orders of at most UNWIND_SLICE 10000; marketable LIMIT 0.04 through the bid: 24.96
         self.api.pos["RITC"] = 20000
         self.assertTrue(self.bot.unwind(self.market(), 10))
-        self.assertEqual(len(self.api.orders), 1)
-        self.assertOrder(self.api.orders[0], "RITC", "SELL", 10000, "LIMIT", 24.96)
+        self.assertEqual(len(self.api.orders), 2)
+        for o in self.api.orders:
+            self.assertOrder(o, "RITC", "SELL", 10000, "LIMIT", 24.96)
+
+    def test_hedge_capped_by_band_depth(self):
+        # 40k long, only 25k within 0.04 of the bid -> 10k + 10k + 5k now, the rest next time
+        self.api.pos["RITC"] = 40000
+        self.bot.unwind(self.market(), 10)
+        self.assertEqual([o[2] for o in self.api.orders], [10000, 10000, 5000])
 
     def test_buy_via_etf(self):
         # Short 20,000 RITC: ETF cost 25.04 + 0.02 = 25.06 vs basket 25.04 + 0.04 = 25.08 -> ETF @ 25.08
@@ -298,13 +325,16 @@ class TestUnwind(BotCase):
         self.assertOrder(self.api.orders[0], "RITC", "BUY", 10000, "LIMIT", 25.08)
 
     def test_sell_via_basket_when_cheaper(self):
-        # RITC bid 24.90 -> ETF proceeds 24.88 < basket 24.96 -> sell 10,000 of EACH leg
+        # RITC bid 24.90 -> ETF proceeds 24.88 < basket 24.96 -> sell 20,000 of EACH leg
+        # (2 orders of 10k per leg)
         self.api.pos["RITC"] = 20000
         self.api.books["RITC"] = ladder(24.90, 24.94)
         self.bot.unwind(self.market(), 10)
-        self.assertEqual(len(self.api.orders), 2)
-        self.assertOrder(self.api.orders[0], "BULL", "SELL", 10000, "LIMIT", 9.96)
-        self.assertOrder(self.api.orders[1], "BEAR", "SELL", 10000, "LIMIT", 14.96)
+        self.assertEqual(len(self.api.orders), 4)
+        for o in self.api.orders[:2]:
+            self.assertOrder(o, "BULL", "SELL", 10000, "LIMIT", 9.96)
+        for o in self.api.orders[2:]:
+            self.assertOrder(o, "BEAR", "SELL", 10000, "LIMIT", 14.96)
 
     def test_basket_over_limits_falls_back_to_etf_depth(self):
         # E = 110k - 50k = +60k, basket cheaper, but selling 10k more of each leg makes
@@ -317,13 +347,14 @@ class TestUnwind(BotCase):
         self.assertOrder(self.api.orders[0], "RITC", "SELL", 5000, "LIMIT", 24.86)
 
     def test_per_tick_budget(self):
-        # 60,000 per tick: six 10k slices, then nothing until the tick changes
+        # 60,000 per tick (25k + 25k + 10k, the fake book never empties), then nothing until
+        # the tick changes
         self.api.pos["RITC"] = 200000
-        for _ in range(7):
+        for _ in range(5):
             self.bot.unwind(self.market(), 10)
-        self.assertEqual(len(self.api.orders), 6)
+        self.assertEqual(sum(o[2] for o in self.api.orders), 60000)
         self.bot.unwind(self.market(), 11)
-        self.assertEqual(len(self.api.orders), 7)
+        self.assertEqual(sum(o[2] for o in self.api.orders), 85000)
 
     def test_small_exposure_ignored(self):
         self.api.pos["RITC"] = 99
@@ -348,7 +379,7 @@ class TestUnwind(BotCase):
         self.api.pos.update(RITC=20000, USD=-900000)
         self.api.books["RITC"] = ladder(25.20, 25.24)   # also a juicy arb, ignored this loop
         self.bot.step(10)
-        self.assertEqual([o[0] for o in self.api.orders], ["RITC"])
+        self.assertEqual({o[0] for o in self.api.orders}, {"RITC"})
 
 
 class TestStatArb(BotCase):
@@ -382,7 +413,8 @@ class TestStatArb(BotCase):
                                            ("BEAR", "SELL", 2000, "MARKET", None)])
 
     def test_max_units_blocks_entry(self):
-        self.api.pos.update(RITC=-30000, BULL=30000, BEAR=30000)
+        n = etf_arb.ARB_MAX_UNITS   # pair already at the cap -> no new entry
+        self.api.pos.update(RITC=-n, BULL=n, BEAR=n)
         self.api.books["RITC"] = ladder(25.20, 25.24)
         self.bot.stat_arb(self.market(), 10)
         self.assertEqual(self.api.orders, [])
@@ -473,6 +505,188 @@ class TestLoop(BotCase):
             self.bot.run()
         self.assertEqual(calls["n"], 2)
         self.assertIn("KeyError", err.getvalue())
+
+
+class TestSettle(BotCase):
+    """The practice-server bug: fills show up in GET /securities ~100-250 ms after the order
+    returns. The bot must not trade again on positions that don't show its last trades yet."""
+
+    # Long 30k RITC, 25k within the band: loop 1 sells 25k (10k + 10k + 5k).
+
+    def setUp(self):
+        super().setUp()
+        self.now = 100.0
+        self.bot.clock = lambda: self.now
+        self.api.report_fills = True
+        self.api.pos["RITC"] = 30000
+
+    def sold(self):
+        return sum(o[2] for o in self.api.orders)
+
+    def test_waits_until_fill_is_visible(self):
+        # Next loops: RIT still shows 30k -> send NOTHING (the old bot re-sent the same sells
+        # here, overshot, and swung back and forth until it hit the gross limit).
+        self.bot.step(10)
+        self.assertEqual(self.sold(), 25000)
+        for _ in range(3):
+            self.now += 0.05
+            self.bot.step(10)
+        self.assertEqual(self.sold(), 25000)
+        self.api.pos["RITC"] = 5000           # the fills show up -> next loop sells the rest
+        self.now += 0.05
+        self.bot.step(10)
+        self.assertEqual(self.sold(), 30000)
+        self.assertOrder(self.api.orders[-1], "RITC", "SELL", 5000, "LIMIT", 24.96)
+
+    def test_partly_visible_still_waits(self):
+        self.bot.step(10)
+        self.api.pos["RITC"] = 15000          # 15k of the 25k shows so far
+        self.now += 0.05
+        self.bot.step(10)
+        self.assertEqual(self.sold(), 25000)
+
+    def test_gives_up_after_timeout(self):
+        self.bot.step(10)
+        self.now += etf_arb.SETTLE_TIMEOUT_MS / 1000 - 0.01
+        self.bot.step(10)
+        self.assertEqual(self.sold(), 25000)
+        self.now += 0.02
+        self.bot.step(10)
+        self.assertGreater(self.sold(), 25000)
+        self.assertIn("fills not visible", self.out.getvalue())
+
+    def test_unknown_fill_size_waits_minimum(self):
+        # order response without quantity_filled: wait SETTLE_MIN_MS, then trust what RIT shows
+        self.api.report_fills = False
+        self.bot.step(10)
+        self.now += etf_arb.SETTLE_MIN_MS / 1000 - 0.01
+        self.bot.step(10)
+        self.assertEqual(self.sold(), 25000)
+        self.now += 0.02
+        self.bot.step(10)
+        self.assertGreater(self.sold(), 25000)
+
+    def test_overfill_counts_as_visible(self):
+        # a resting remainder filled too: moved more than reported is fine
+        self.bot.step(10)
+        self.api.pos["RITC"] = 0              # reported 25k sold, RIT shows 30k sold
+        self.now += 0.05
+        self.api.pos["USD"] = 0
+        self.bot.step(10)
+        self.assertIsNone(self.bot.pending)
+
+    def test_tender_accept_stops_the_loop(self):
+        # accepting a tender makes RITC stale: no arb/unwind in the same loop, then wait for it
+        self.api.pos["RITC"] = 0
+        self.api.tender_list = [tender(price=24.90)]
+        self.api.books["RITC"] = ladder(25.00, 25.04, qty=20000)
+        self.bot.step(10)
+        self.assertEqual([c[0] for c in self.api.calls], ["cancel_all", "accept"])
+        self.now += 0.05
+        self.bot.step(10)                     # RITC still 0 on RIT -> wait
+        self.assertEqual(self.api.orders, [])
+        self.api.pos["RITC"] = 10000          # tender shows up -> hedge it
+        self.now += 0.05
+        self.bot.step(10)
+        self.assertEqual(self.api.orders[0][:2], ("RITC", "SELL"))
+
+    def test_rejected_order_backs_off(self):
+        # the live run resent one rejected order 3,022 times; now it pauses REJECT_BACKOFF_MS
+        self.api.reject = True
+        self.bot.step(10)
+        self.assertEqual(len(self.api.orders), 1)          # first slice fails -> rest not sent
+        self.now += etf_arb.SETTLE_MIN_MS / 1000 + 0.01    # fill wait over, backoff not yet
+        self.bot.step(10)
+        self.assertEqual(len(self.api.orders), 1)
+        self.now = 100.0 + etf_arb.REJECT_BACKOFF_MS / 1000 + 0.01
+        self.bot.step(10)
+        self.assertEqual(len(self.api.orders), 2)
+
+    def test_tenders_still_decided_during_backoff(self):
+        self.api.reject = True
+        self.bot.step(10)
+        self.now += etf_arb.SETTLE_MIN_MS / 1000 + 0.01
+        self.api.tender_list = [tender(price=26.00)]       # bad price -> decline
+        self.bot.step(10)
+        self.assertIn(("decline", 1), self.api.calls)
+
+    def test_new_heat_clears_wait(self):
+        self.bot.step(250)
+        self.now += 0.05
+        self.bot.step(1)                      # tick went backwards: new heat, old fills irrelevant
+        self.assertEqual(self.sold(), 50000)
+
+
+class TestLimitsWhenHedging(BotCase):
+    def test_leg_balance_uses_other_leg_near_limit(self):
+        # Final state of the bad practice heat: gross 295,176 / 300,000, legs off by 7,616.
+        # Preferred: E <= 0 -> BUY 7,616 BEAR, which the server rejected 3,022 times.
+        # Now: that breaks the limit, so SELL 7,616 BULL instead (cuts gross).
+        self.api.pos.update(RITC=-73794, BULL=77602, BEAR=69986)
+        self.assertTrue(self.bot.unwind(self.market(), 100))
+        self.assertEqual(self.api.orders, [("BULL", "SELL", 7616, "MARKET", None)])
+
+    def test_unwind_etf_blocked_when_it_adds_gross(self):
+        # E = +60k from a long basket at the limit; basket sell is cheaper but adds gross? No:
+        # selling long legs CUTS gross, so the basket is used. Make the ETF the only route and
+        # check it is blocked when shorting RITC would push gross over the limit.
+        self.api.pos.update(RITC=0, BULL=130000, BEAR=130000)   # E = +130k, gross 260k
+        self.api.books["BULL"] = ladder(9.80, 9.82)             # basket much worse -> ETF wins
+        m = self.market()
+        self.bot.unwind(m, 100)
+        # ETF sell 10k -> gross 280k > 270k and it adds gross -> blocked; nothing sent
+        self.assertEqual(self.api.orders, [])
+        self.assertIn("blocked by limits", self.out.getvalue())
+
+    def test_unwind_allowed_over_headroom_when_it_cuts_gross(self):
+        # already over 90% (gross 280k): selling 10k of a 140k long RITC cuts gross -> allowed
+        self.api.pos.update(RITC=140000)
+        self.bot.unwind(self.market(), 100)
+        self.assertEqual(self.api.orders[0][:3], ("RITC", "SELL", 10000))
+
+    def test_read_limits_picks_limit_stock(self):
+        # the practice server also returns LIMIT-CASH (10M); it may come first
+        self.api.limit_list = [{"name": "LIMIT-CASH", "gross_limit": 10000000, "net_limit": 10000000},
+                               {"name": "LIMIT-STOCK", "gross_limit": 300000, "net_limit": 200000}]
+        bot = Bot(self.api, dry_run=True)
+        self.assertTrue(bot.read_limits())
+        self.assertEqual((bot.gross_limit, bot.net_limit), (300000, 200000))
+
+
+class TestLogFailures(unittest.TestCase):
+    def test_bad_log_path_runs_without_log(self):
+        # the first live practice launch died here: PermissionError on the CSV
+        import sys
+        from unittest import mock as um
+        argv = ["etf_arb.py", "--key", "K", "--host", "127.0.0.1", "--port", "9", "--log",
+                os.path.join(tempfile.mkdtemp(), "no_such_dir", "x.csv")]
+        out = io.StringIO()
+        with um.patch.object(sys, "argv", argv), um.patch.object(Bot, "run", lambda self: None), \
+                contextlib.redirect_stdout(out):
+            etf_arb.main()
+        self.assertIn("running WITHOUT a CSV log", out.getvalue())
+
+    def test_write_error_stops_logging_not_bot(self):
+        path = os.path.join(tempfile.mkdtemp(), "t.csv")
+        log = TickLog(path)
+        log.f.close()                          # any later write raises ValueError/OSError
+
+        class Broken:
+            def write(self, *_):
+                raise OSError("disk full")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+        log.f = Broken()
+        log.w = csv.writer(log.f)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            log.row([1, 2, 3])
+            log.row([4, 5, 6])                 # no second error: logging is off
+        self.assertEqual(err.getvalue().count("CSV log write failed"), 1)
+        log.close()
 
 
 # =============================================================================================== #
@@ -580,6 +794,17 @@ class TestClient(unittest.TestCase):
             self.api.case()
         self.assertIn("API key", str(cm.exception))
 
+    def test_401_after_key_worked_means_heat_over(self):
+        # practice server: 401 a few seconds after every heat ends, same key works next heat.
+        # Once the key has worked, a 401 must NOT exit the bot: fail the call, keep waiting.
+        Scripted.script[("GET", "/v1/case")] = [("json", 200, {"tick": 300, "status": "STOPPED"}),
+                                                ("json", 401, {"message": "API key is invalid"}),
+                                                ("json", 200, {"tick": 1, "status": "ACTIVE"})]
+        self.assertEqual(self.api.case()["status"], "STOPPED")
+        self.assertIsNone(self.api.case())
+        self.assertIn("heat over", self.api.last_error)
+        self.assertEqual(self.api.case()["status"], "ACTIVE")
+
     def test_dropped_post_is_not_resent(self):
         # the server got the order but the reply was lost: it must NOT be sent again
         Scripted.script[("POST", "/v1/orders")] = [("drop",)]
@@ -645,7 +870,9 @@ class TestFullHeatOnMock(unittest.TestCase):
     def test_full_heat(self):
         import mock_rit_server as mock
         random.seed(8)
-        mock.M = mock.Market("etf", 0.1, 10)        # 300 ticks x 0.1 s = 30 s heat
+        # 300 ticks x 0.1 s = 30 s heat. Fills show in /securities 0.2 s late, as on the practice
+        # server (without the fill wait the bot churned to the gross limit here).
+        mock.M = mock.Market("etf", 0.1, 10, position_lag=0.2)
         srv = ThreadingHTTPServer(("127.0.0.1", 0), mock.Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         path = os.path.join(tempfile.mkdtemp(), "heat.csv")
