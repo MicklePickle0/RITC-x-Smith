@@ -116,6 +116,8 @@ def implied_vol(price, S, K, T, kind, lo=1e-4, hi=3.0):
 # --------------------------------------------------------------------------- #
 RE_THIS = re.compile(r"this week[^0-9]*?(\d+(?:\.\d+)?)\s*%", re.I)
 RE_RANGE = re.compile(r"next week[^0-9]*?(\d+(?:\.\d+)?)\s*%?\s*(?:-|–|to|and)\s*(\d+(?:\.\d+)?)\s*%", re.I)
+# week-1 headline on the real case: "... its current annualized realized volatility is 14%."
+RE_CURRENT = re.compile(r"annualized (?:realized )?volatility is\s*(\d+(?:\.\d+)?)\s*%", re.I)
 
 
 class VolModel:
@@ -145,7 +147,7 @@ class VolModel:
             self.sigma_next = (lo + hi) / 2
             self.log.append(f"t{item.get('tick')}: next week {lo:.0%}-{hi:.0%}")
             return
-        m = RE_THIS.search(text)
+        m = RE_THIS.search(text) or RE_CURRENT.search(text)
         if m:
             self.sigma_now = float(m.group(1)) / 100
             self.sigma_next = None
@@ -202,6 +204,12 @@ class Scanner:
     # ---- data ---------------------------------------------------------- #
     def poll(self):
         _, case = self.api.get("/case")
+        tick = (case or {}).get("tick", 0)
+        if tick < getattr(self, "last_tick", 0):   # new heat: news ids restart, forget old news
+            self.model = VolModel()
+            self.last_news_id = 0
+            self.messages.append(f"new heat detected (tick {tick}): news and sigma forecast reset")
+        self.last_tick = tick
         _, secs = self.api.get("/securities")
         _, news = self.api.get("/news", after=self.last_news_id, limit=50)
         _, trader = self.api.get("/trader")
@@ -504,6 +512,10 @@ def main():
         except (OSError, http.client.HTTPException) as e:
             print(f"connection problem ({e}); is the RIT Client running with the API enabled? retrying...")
             time.sleep(1)
+        except Exception as e:   # e.g. RTM price 0 for a moment at heat start: skip this refresh
+            print(f"skipped one refresh ({type(e).__name__}: {e}); retrying...")
+            if a.once:
+                raise
         if a.once:
             break
         time.sleep(a.refresh)
